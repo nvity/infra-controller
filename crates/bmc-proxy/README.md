@@ -104,6 +104,40 @@ Path matching syntax:
   Invalid: `/redfish/v1/Systems/sys*tem/SecureBoot`
 - At most one `**` is allowed in an ACL path.
 
+The matcher resolves no `.` or `..` segment and decodes no escape: it compares
+the spelling that arrived. Two things downstream read that spelling differently,
+so a request path carrying either is refused with `400` before the ACLs run:
+
+- **Dot segments**, in every spelling the URL standard counts as one — `.`,
+  `..`, `%2e`, `%2E`, `.%2e`. Building the upstream URL resolves them.
+- **Percent-escapes of any kind.** The BMC decodes them (`%53ystems` is
+  `Systems`; `%2F` may split a component); the matcher does not.
+
+Every escape, rather than a safe subclass — and DSP0266 clause 6.1 asks for no
+less: "URIs shall not include any percent-encoding of characters. This
+restriction does not apply to the query parameters portion of the URI." Only
+the path is checked here, so the two scopes agree. A safe subclass would be
+nearly empty anyway: it is the escapes whose decoded character no ACL can
+spell, and of the printable characters the grammar rejects only space, `#`,
+`<`, `>`, `?` and `` ` ``. Nor does a wildcard position make one safe — `%2F`
+creates a component the length check then misses, and an escape evades an
+exact-match deny at the position a later `*` allows.
+
+Characters outside the URL path set are refused under the first rule, the braces
+of a templated `{id}` among them — which clause 6.1 also names among the
+characters a URI shall not carry, so an ACL entry left holding one matches
+nothing a conformant service serves. A square-bracketed address survives:
+brackets are not in that set, and this check is about the two readings agreeing
+rather than about URI hygiene. A zone id like `fe80::1%25eth0` is refused as an
+escape.
+
+Redirects are **not followed**; the `3xx` is returned. Each hop needs its own
+target and ACL decision, and the upstream client has neither: it is built once
+the target is known, and sends the BMC's credentials with whatever it is given.
+A `Location` naming the same BMC is reduced to a relative reference, so the
+caller repeats it through the proxy and it is authorised again; one naming
+another host is passed on untouched.
+
 Examples:
 
 - `"/**"`
