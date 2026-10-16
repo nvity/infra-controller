@@ -34,8 +34,8 @@ Validate and return the redirect handling mode.
 */}}
 {{- define "nico-bmc-proxy.redirectMode" -}}
 {{- $redirectMode := required "bmcProxy.redirectMode is required" .Values.bmcProxy.redirectMode -}}
-{{- if not (has $redirectMode (list "follow_same_origin" "return_to_client")) -}}
-{{- fail (printf "bmcProxy.redirectMode must be one of follow_same_origin or return_to_client; got %q" $redirectMode) -}}
+{{- if not (has $redirectMode (list "follow_same_origin" "follow_authorized" "return_to_client")) -}}
+{{- fail (printf "bmcProxy.redirectMode must be one of follow_same_origin, follow_authorized, or return_to_client; got %q" $redirectMode) -}}
 {{- end -}}
 {{- $redirectMode -}}
 {{- end -}}

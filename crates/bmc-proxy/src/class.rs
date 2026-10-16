@@ -115,7 +115,7 @@ struct ClassDefinition {
     /// `anonymous`, which every caller holds.
     #[serde(default)]
     principals: Option<Vec<String>>,
-    /// Total budget for one upstream exchange in this class.
+    /// Base budget for one upstream exchange in this class.
     #[serde(with = "humantime_serde", default = "default_upstream_timeout")]
     upstream_timeout: Duration,
     /// The order in which this class's waiting requests reach a BMC under
@@ -152,12 +152,14 @@ pub(crate) struct RequestClass {
     /// empty takes every caller's.
     principals: Vec<String>,
     patterns: Vec<RequestPattern>,
-    /// Total budget for one upstream exchange: looking up the BMC's
+    /// Base budget for one upstream exchange: looking up the BMC's
     /// credentials, waiting for a slot there, and from connecting to the BMC
     /// until the last byte of its response body has been streamed to the
     /// caller, redirects included. A request replayed with fresh credentials
     /// gets a budget of its own. A streamed upload looks up credentials and
     /// waits within this budget, then scales its own from its declared size.
+    /// Authorized following extends the deadline by half this original budget
+    /// for each of at most five followed redirects.
     pub(crate) upstream_timeout: Duration,
     /// Higher is admitted first when classes wait for the same BMC under the
     /// per-BMC limit.

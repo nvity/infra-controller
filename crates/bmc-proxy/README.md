@@ -34,8 +34,8 @@ Important configuration fields:
   to a BMC at a time; see [`class`](#class)
 - `admission`: optional limit on the requests the proxy sends to each BMC; see
   [`admission`](#admission)
-- `redirects.mode`: redirect policy, either `follow_same_origin` (default) or
-  `return_to_client`
+- `redirects.mode`: redirect policy: `follow_same_origin` (default),
+  `follow_authorized` (opt-in per-hop ACL checks), or `return_to_client`
 
 Example shape:
 
@@ -100,8 +100,53 @@ wait. These timers do not limit connection concurrency.
 port. Redirects are returned instead when a `307` or `308` requires replaying a streamed request
 body, or when chaining produces a redirect to the BMC's direct HTTPS address on port 443.
 
-Automatically followed redirects do not re-run ACL authorization. Same-origin checks protect
-credential scope; they do not establish that the redirected path is allowed for the principal.
+In `follow_same_origin`, automatically followed redirects do not re-run ACL authorization.
+Same-origin checks protect credential scope; they do not establish that the redirected path is
+allowed for the principal.
+
+`follow_authorized` opts into a proxy-controlled loop with the same five-hop and same-origin
+limits. Before sending each redirected request, the proxy validates its resolved path and checks
+the effective HTTP method and path against the original caller's ACLs. A denied hop returns `403`;
+a malformed or structurally unsafe path returns `502`. The denied destination receives no request.
+Relative `Location` references, including dot segments, are resolved against the current response
+URL before authorization; the checked path and query are the ones sent upstream. Fragments are
+never sent upstream. Percent escapes in the resolved path follow the same explicit-allow rules as
+incoming paths. Safe redirects to a direct BMC address behind a chained proxy are returned to the
+caller rather than followed.
+
+The effective method and body follow Reqwest's redirect semantics:
+
+| Status | Next method and body |
+| --- | --- |
+| `301`, `302` | POST becomes GET without a body; other methods retain their method and body. |
+| `303` | HEAD stays HEAD; other methods become GET. The body and payload headers are removed. |
+| `307`, `308` | Method and body are retained. A consumed streamed body cannot be replayed, so the redirect is returned. |
+| Other statuses | No automatic following; the normal response and `Location` safety rules apply. |
+
+When discarding a body, this mode also removes representation metadata, including
+`Content-Language`, `Content-Location`, `Content-Range`, digest fields, and `Last-Modified`, following
+[RFC 9110 section 15.4](https://www.rfc-editor.org/rfc/rfc9110.html#section-15.4).
+It also removes `Expect` because the redirected request no longer carries content.
+
+One authentication retry is permitted across the entire replayable-body exchange. An upstream
+`401` or `403` retries only the rejected hop with fresh credentials; earlier operations are not
+replayed. Exchanges that began with a streamed body do not refresh credentials automatically,
+even after a redirect discards that body. Final errors and returned redirects are sanitized using
+the credentials used throughout the chain.
+
+Each authorized redirect actually followed extends the existing deadline by half the original
+class's `upstream_timeout`, retaining unused time. The increment always uses that original budget
+and does not compound. With a 60-second class budget, zero, one, or five followed redirects allow
+60, 90, or 210 seconds, respectively. Rejected or returned redirects receive no extension.
+Credential refresh starts one additional original-class budget; the five-redirect count remains
+shared across the exchange. The maximum replayable exchange is therefore bounded by 4.5 times
+the original class budget, including the one permitted authentication retry.
+
+Streamed exchanges retain their class-bounded prerequisite budget and one scaled upload allowance,
+plus at most five half-class-budget extensions after discarding the upload body. The upload
+allowance is not renewed. The original class and single admission slot remain in use through the
+final response body; redirect targets are not reclassified. Local path and ACL rejections do not
+count as BMC failures for the circuit breaker.
 
 For safe redirects returned to the client, the proxy removes the scheme and authority from
 `Location`, preserving the path, query, and fragment. The client must send the same `Forwarded`
@@ -117,7 +162,7 @@ cross-origin redirect is rejected instead of being followed.
 `return_to_client` disables automatic following and returns safe redirects using the same rewrite
 so the caller can make a separately authorized request. This mode is experimental.
 
-Both modes reject redirect URLs with a non-empty username or any password before following
+All three modes reject redirect URLs with a non-empty username or any password before following
 or rewriting them. Non-HTTP(S), malformed, ambiguous, other cross-origin targets, and returned
 Locations containing known upstream credentials are also rejected. On a non-redirect response
 such as a Redfish session creation `201`, the proxy rewrites a safe same-BMC `Location` and omits
@@ -260,7 +305,7 @@ upstream_timeout = "90s"
   are classified. Optional; a class without it takes every caller's requests.
   It may not be empty, list `anonymous`, which every caller holds, or list an
   empty or whitespace-padded identifier, and `default` may not set it.
-- `upstream_timeout`: how long one exchange with the BMC may take, as a
+- `upstream_timeout`: the base budget for one exchange with the BMC, as a
   duration string such as `"500ms"`, `"45s"`, or `"5m"`, above zero and at
   most 30 minutes. A class that omits it gets 60 seconds, not the `default`
   class's budget.
@@ -284,9 +329,11 @@ upstream_timeout = "90s"
 The budget covers looking up the BMC's credentials in nico-api and any wait
 for a slot at the BMC (see [`admission`](#admission)), then runs from
 connecting to the BMC until the proxy has read the last byte of the BMC's
-response body, redirects the proxy follows included. Most
-bodies are passed on to the caller as they are read, so a slow caller spends
-the budget too. When the budget runs out while the proxy looks up credentials
+response body, redirects the proxy follows included. In `follow_authorized`,
+followed redirects extend that deadline as described in
+[`redirects.mode`](#redirectsmode). Most bodies are passed on to the caller as
+they are read, so a slow caller spends the budget too. When the budget runs
+out while the proxy looks up credentials
 or waits for the BMC to answer, the caller gets `502`; while the request waits
 for a slot, `429`; while the body is being passed on, the body is cut off. A
 request the proxy replays with fresh credentials gets a budget of its own,
@@ -351,9 +398,12 @@ the caller, or the exchange has failed; a replay with fresh credentials keeps
 the same slot. From the moment it gets the slot, it holds it no longer than
 its exchange with the BMC can take, though: twice its class's budget, for a
 first attempt and a replay, or its class's budget and its own for a streamed
-upload. Past that, the slot goes to the next waiting request, so a caller
-that stops reading cannot keep it, though the proxy keeps that response's
-connection to the BMC open until the caller reads on or goes away.
+upload. In `follow_authorized`, the maximum slot lifetime also reserves the
+five half-class-budget extensions: 4.5 times the class budget for a replayable
+exchange, or 3.5 times the class budget plus the scaled upload allowance for
+a streamed exchange. Past that, the slot goes to the next waiting request, so
+a caller that stops reading cannot keep it, though the proxy keeps that
+response's connection to the BMC open until the caller reads on or goes away.
 
 A request that finds no free slot waits at the proxy in its class's queue for
 that BMC. A freed slot goes to the highest-priority class that has a request
@@ -445,8 +495,12 @@ answer within its budget is a `"timeout"`, including one whose budget, under 5
 seconds, ran out while it was connecting, but only when it had at least half
 its class's budget: a shorter attempt was cut short by its wait for a slot,
 and a streamed upload that times out may have been slowed by its caller, so
-neither counts. A status counts as the BMC's answer to the last attempt, after
-any replay with fresh credentials. A connection the BMC closes without
+neither counts. In `follow_authorized`, the timeout budget includes time
+spent receiving earlier BMC replies in the same attempt, so a short final-hop
+remainder does not suppress a failure. Admission waits and credential lookups
+are excluded from that earlier BMC time. Credential refresh starts a new
+attempt for this accounting. A status counts as the BMC's answer to the last
+attempt, after any replay with fresh credentials. A connection the BMC closes without
 answering, a body that stalls after the answer, and a failure of the proxy's
 own, such as a credential lookup, never count. Every other freed slot counts
 as a success, including one whose request stopped waiting, or got its slot too

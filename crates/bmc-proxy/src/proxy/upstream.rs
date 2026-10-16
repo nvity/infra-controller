@@ -62,7 +62,7 @@ const MAX_UPLOAD_TIMEOUT: Duration = Duration::from_secs(4 * 60 * 60);
 
 /// Match the redirect limit used before redirect targets were restricted to
 /// the original request's origin.
-const MAX_REDIRECTS: usize = 5;
+pub(super) const MAX_REDIRECTS: usize = 5;
 
 /// The caller's request body, in a form the proxy can attach to an upstream
 /// request -- and, when buffered, attach again for one retry.
@@ -84,6 +84,8 @@ pub(super) enum UpstreamBody {
 pub(super) struct UpstreamResponse {
     pub(super) response: reqwest::Response,
     pub(super) sensitive_values: Vec<String>,
+    /// Time spent sending to the BMC and waiting for its response headers.
+    pub(super) took: Duration,
 }
 
 /// An attempt that got no answer from the BMC: the caller's answer, and how
@@ -97,8 +99,20 @@ pub(super) struct AttemptFailed {
 pub(super) enum BmcFailure {
     /// The proxy could not connect to it.
     Unreachable,
-    /// It did not answer within the attempt's `budget`.
-    TimedOut { budget: Duration },
+    /// It did not answer within `budget`: the failing send's available time
+    /// plus time spent on earlier BMC replies in the same authorized attempt.
+    TimedOut { budget: Duration, streamed: bool },
+}
+
+impl AttemptFailed {
+    /// Includes preceding BMC sends in timeout attribution. Their elapsed
+    /// time excludes admission waits and credential lookups.
+    pub(super) fn with_prior_bmc_time(mut self, took: Duration) -> Self {
+        if let Some(BmcFailure::TimedOut { budget, .. }) = &mut self.by_bmc {
+            *budget = budget.saturating_add(took);
+        }
+        self
+    }
 }
 
 impl From<Response<Body>> for AttemptFailed {
@@ -131,18 +145,36 @@ impl UpstreamBody {
         matches!(self, Self::None | Self::Buffered(_))
     }
 
+    /// A streamed upload's transfer budget, reserved once for the entire
+    /// authorized redirect chain after the class-bounded prerequisite waits.
+    pub(super) fn streamed_timeout(&self) -> Option<Duration> {
+        match self {
+            Self::Streamed {
+                declared_length, ..
+            } => Some(sized_upload_timeout(*declared_length)),
+            Self::None | Self::Buffered(_) => None,
+        }
+    }
+
     /// The longest the exchange with the BMC for this body can take under a
     /// class's `budget`, credential lookups included: a first attempt and a
     /// replay with fresh credentials, each within the budget, or a streamed
     /// body's single attempt, whose lookup is within the budget and whose
-    /// transfer is within its own scaled budget.
-    pub(super) fn exchange_bound(&self, budget: Duration) -> Duration {
-        match self {
+    /// transfer is within its own scaled budget. Authorized following also
+    /// reserves half the class budget for each permitted redirect.
+    pub(super) fn exchange_bound(&self, budget: Duration, mode: RedirectMode) -> Duration {
+        let attempts = match self {
             Self::Streamed {
                 declared_length, ..
             } => budget.saturating_add(sized_upload_timeout(*declared_length)),
             Self::None | Self::Buffered(_) => budget.saturating_mul(2),
-        }
+        };
+        let redirects = if mode == RedirectMode::FollowAuthorized {
+            (budget / 2).saturating_mul(MAX_REDIRECTS as u32)
+        } else {
+            Duration::ZERO
+        };
+        attempts.saturating_add(redirects)
     }
 
     /// Attaches the body to `request` with the exchange's budget: `timeout`
@@ -234,21 +266,24 @@ pub(super) async fn send_upstream(
             error_response((StatusCode::BAD_GATEWAY, format!("invalid credentials: {e}")).into())
         })?;
     let budget = deadline.saturating_duration_since(tokio::time::Instant::now());
+    let streamed = !upstream_body.is_replayable();
     let upstream_request = upstream_body
         .attach(upstream_request, budget)
         .map_err(error_response)?;
 
     let started = Instant::now();
     let upstream_result = upstream_request.send().await;
+    let took = started.elapsed();
     emit(UpstreamRequestCompleted {
         method: MethodLabel::from(&parts.method),
         status: UpstreamStatus::from_result(&upstream_result),
-        took: started.elapsed(),
+        took,
     });
     upstream_result
         .map(|response| UpstreamResponse {
             response,
             sensitive_values,
+            took,
         })
         .map_err(|error| AttemptFailed {
             by_bmc: match &error {
@@ -256,7 +291,7 @@ pub(super) async fn send_upstream(
                     Some(BmcFailure::Unreachable)
                 }
                 reqwest_middleware::Error::Reqwest(cause) if cause.is_timeout() => {
-                    Some(BmcFailure::TimedOut { budget })
+                    Some(BmcFailure::TimedOut { budget, streamed })
                 }
                 _ => None,
             },
@@ -421,7 +456,7 @@ pub(super) fn build_http_client(
 /// handling while preventing credentials from crossing an origin boundary.
 fn redirect_policy(mode: RedirectMode) -> reqwest::redirect::Policy {
     reqwest::redirect::Policy::custom(move |attempt| {
-        if mode == RedirectMode::ReturnToClient {
+        if mode != RedirectMode::FollowSameOrigin {
             return attempt.stop();
         }
 
@@ -1217,7 +1252,7 @@ mod tests {
     /// A slot is held no longer than the exchange can take: a first attempt
     /// and a replay within the class's budget, or a streamed body's
     /// credential lookup within the budget and its single transfer within its
-    /// scaled budget.
+    /// scaled budget, plus the authorized mode's bounded redirect extensions.
     #[tokio::test]
     async fn an_exchange_is_bounded_by_its_attempts() {
         let large = (MAX_BUFFERED_BODY_SIZE as u64) + 1;
@@ -1225,16 +1260,26 @@ mod tests {
             [
                 Case {
                     scenario: "a body sent whole is sent twice at most",
-                    input: 1024,
+                    input: (1024, RedirectMode::FollowSameOrigin),
                     expect: Yields(2 * CLASS_BUDGET),
                 },
                 Case {
                     scenario: "a streamed body is sent once, after its lookup",
-                    input: large,
+                    input: (large, RedirectMode::ReturnToClient),
                     expect: Yields(CLASS_BUDGET + super::sized_upload_timeout(large)),
                 },
+                Case {
+                    scenario: "authorized redirects and one replay have a linear bound",
+                    input: (1024, RedirectMode::FollowAuthorized),
+                    expect: Yields(9 * CLASS_BUDGET / 2),
+                },
+                Case {
+                    scenario: "authorized redirects reserve the streamed allowance once",
+                    input: (large, RedirectMode::FollowAuthorized),
+                    expect: Yields(7 * CLASS_BUDGET / 2 + super::sized_upload_timeout(large)),
+                },
             ],
-            |declared_length| async move {
+            |(declared_length, mode)| async move {
                 let mut headers = HeaderMap::new();
                 headers.insert(
                     axum::http::header::CONTENT_LENGTH,
@@ -1244,7 +1289,7 @@ mod tests {
                 let body = UpstreamBody::prepare(&headers, Body::from("payload"))
                     .await
                     .map_err(|e| e.to_string())?;
-                Ok::<_, String>(body.exchange_bound(CLASS_BUDGET))
+                Ok::<_, String>(body.exchange_bound(CLASS_BUDGET, mode))
             },
         )
         .await;

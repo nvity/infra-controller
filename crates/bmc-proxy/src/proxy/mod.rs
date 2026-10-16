@@ -42,6 +42,7 @@
 //! credentials and sends the request once more with fresh ones.
 
 mod admission;
+mod authorized_redirects;
 mod credentials;
 #[cfg(test)]
 mod end_to_end_tests;
@@ -76,9 +77,10 @@ use trace_propagation::set_span_parent_from_headers;
 use tracing::Instrument;
 
 use crate::class::RequestClass;
-use crate::config::Trip;
+use crate::config::{RedirectMode, Trip};
 use crate::metrics::{MethodLabel, UpstreamAuthRetried};
 use crate::proxy::admission::{Admission, Slot};
+use crate::proxy::authorized_redirects::send_authorized_upstream;
 use crate::proxy::credentials::{
     CREDENTIAL_CACHE_IDLE_TTL, CredentialCache, evict_cached_credentials, get_bmc_credentials,
 };
@@ -319,6 +321,8 @@ fn span_status(status: StatusCode) -> &'static str {
     }
 }
 
+/// Runs a request under its original class and BMC admission slot; redirect
+/// traversal and credential refresh retain that slot through the final body.
 async fn proxy_request_inner(
     state: BmcProxyState,
     request: Request<Body>,
@@ -409,7 +413,6 @@ async fn proxy_request_inner(
         )
     })?
     .map_err(|e| error_response((StatusCode::BAD_GATEWAY, e.to_string()).into()))?;
-    let streamed = !upstream_body.is_replayable();
     let mut slot = state
         .admission
         .acquire(
@@ -417,20 +420,33 @@ async fn proxy_request_inner(
             class,
             arrived,
             deadline,
-            upstream_body.exchange_bound(class.upstream_timeout),
+            upstream_body.exchange_bound(class.upstream_timeout, state.config.redirects.mode),
         )
         .await
         .map_err(|refused| error_response((refused.status(), refused.to_string()).into()))?;
-    let mut upstream_response = send_upstream(
-        &state,
-        target_ip,
-        &parts,
-        path_and_query.clone(),
-        &mut upstream_body,
-        deadline,
-    )
-    .await
-    .map_err(|failed| answer_failed_attempt(&mut slot, failed, class, streamed))?;
+    let mut upstream_response = if state.config.redirects.mode == RedirectMode::FollowAuthorized {
+        send_authorized_upstream(
+            &state,
+            target_ip,
+            &parts,
+            &principals,
+            &mut upstream_body,
+            deadline,
+            class.upstream_timeout,
+        )
+        .await
+    } else {
+        send_upstream(
+            &state,
+            target_ip,
+            &parts,
+            path_and_query.clone(),
+            &mut upstream_body,
+            deadline,
+        )
+        .await
+    }
+    .map_err(|failed| answer_failed_attempt(&mut slot, failed, class))?;
 
     // A BMC that rejects the credential the proxy cached (an expired Redfish
     // session, a rotated password) gets one replay with freshly resolved
@@ -439,7 +455,10 @@ async fn proxy_request_inner(
     let rejected = |status: reqwest::StatusCode| {
         status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN
     };
-    if rejected(upstream_response.response.status()) && upstream_body.is_replayable() {
+    if state.config.redirects.mode != RedirectMode::FollowAuthorized
+        && rejected(upstream_response.response.status())
+        && upstream_body.is_replayable()
+    {
         evict_cached_credentials(target_ip, &state.credential_cache).await;
         emit(UpstreamAuthRetried {
             method: MethodLabel::from(&parts.method),
@@ -454,12 +473,13 @@ async fn proxy_request_inner(
             tokio::time::Instant::now() + class.upstream_timeout,
         )
         .await
-        .map_err(|failed| answer_failed_attempt(&mut slot, failed, class, streamed))?;
+        .map_err(|failed| answer_failed_attempt(&mut slot, failed, class))?;
     }
 
     let UpstreamResponse {
         response,
         sensitive_values,
+        ..
     } = upstream_response;
     let status = response.status();
     report(&mut slot, class, Trip::Status(status));
@@ -494,21 +514,22 @@ async fn proxy_request_inner(
 /// the BMC failed: one the proxy could not connect for, or one the BMC did
 /// not answer within at least half its class's budget. A shorter attempt was
 /// cut short by the wait for its slot, and a timed-out upload, `streamed`,
-/// may have been the caller's. Against the class's latency target, an
+/// may have been the caller's. Authorized chains include time already spent
+/// on BMC replies, so the final hop's short remainder does not erase it.
+/// Against the class's latency target, an
 /// attempt that timed out counts as long as the request took, and one the
 /// proxy could not connect for, or failed on its own, does not count.
 fn answer_failed_attempt(
     slot: &mut Slot,
     failed: AttemptFailed,
     class: &RequestClass,
-    streamed: bool,
 ) -> Response<Body> {
     if !matches!(failed.by_bmc, Some(BmcFailure::TimedOut { .. })) {
         slot.unmeasured();
     }
     let ended = match failed.by_bmc {
         Some(BmcFailure::Unreachable) => Some(Trip::Unreachable),
-        Some(BmcFailure::TimedOut { budget })
+        Some(BmcFailure::TimedOut { budget, streamed })
             if !streamed && budget >= class.upstream_timeout / 2 =>
         {
             Some(Trip::Timeout)

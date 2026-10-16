@@ -13,19 +13,28 @@ This chart deploys `nico-bmc-proxy` and renders its main TOML config into the
   address on port 443 is also returned instead of followed.
 - `return_to_client` is experimental. The proxy returns safe redirects without following them;
   unsafe targets return `502`.
+- `follow_authorized` is opt-in. The proxy follows at most five same-origin redirects, validating
+  and authorizing each resolved path and effective HTTP method for the original caller before
+  sending it. A denied target returns `403` without contacting that destination. Unsafe paths
+  return `502`. Safe direct-BMC redirects behind a chained proxy are returned to the caller.
+  Each followed redirect adds half the original request class's timeout to the existing deadline,
+  retaining unused time without compounding. The original class and admission slot stay in use.
+  Method/body transformations, streamed-body handling, credential retries, and deadline rules are
+  documented in the [proxy redirect contract](../../../crates/bmc-proxy/README.md#redirectsmode).
 
-Automatically followed redirects do not re-run ACL authorization. Same-origin checks protect
-credential scope; they do not establish that the redirected path is allowed for the principal.
+In `follow_same_origin`, automatically followed redirects do not re-run ACL authorization.
+Same-origin checks protect credential scope; they do not establish that the redirected path is
+allowed for the principal.
 
 For safe redirects returned to the client, the proxy removes the scheme and authority from
 `Location`, preserving the path, query, and fragment. The client must send the same `Forwarded`
 target on its follow-up request.
 
-In either mode, a cross-origin target other than the recognized direct address of the same BMC, a
+In every mode, a cross-origin target other than the recognized direct address of the same BMC, a
 non-HTTP(S) target, or a malformed, credential-bearing, or otherwise unsafe target returns `502`
 without exposing its `Location` - never followed or returned to clients.
 
-Both modes rewrite a safe same-BMC `Location` on non-redirect responses, such as a Redfish session
+All three modes rewrite a safe same-BMC `Location` on non-redirect responses, such as a Redfish session
 creation `201`, to a relative reference. An unsafe `Location` on a non-redirect response is omitted
 without changing the response status.
 

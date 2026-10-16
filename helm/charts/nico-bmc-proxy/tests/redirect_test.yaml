@@ -27,6 +27,18 @@ tests:
             name: NICO_BMC_PROXY__REDIRECTS__MODE
             value: return_to_client
 
+  - it: can authorize every automatically followed redirect hop
+    set:
+      global.image.repository: registry.example.com/nvmetal-carbide
+      global.image.tag: test
+      bmcProxy.redirectMode: follow_authorized
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: NICO_BMC_PROXY__REDIRECTS__MODE
+            value: follow_authorized
+
   - it: rejects an unsupported redirect mode
     set:
       global.image.repository: registry.example.com/nvmetal-carbide
@@ -34,4 +46,4 @@ tests:
       bmcProxy.redirectMode: follow_anywhere
     asserts:
       - failedTemplate:
-          errorMessage: 'bmcProxy.redirectMode must be one of follow_same_origin or return_to_client; got "follow_anywhere"'
+          errorMessage: 'bmcProxy.redirectMode must be one of follow_same_origin, follow_authorized, or return_to_client; got "follow_anywhere"'

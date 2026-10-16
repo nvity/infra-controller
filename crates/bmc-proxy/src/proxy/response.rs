@@ -241,7 +241,7 @@ impl BmcOrigins {
 
 /// How an upstream `Location` can be relayed to the proxy client.
 #[derive(Debug, PartialEq)]
-enum RedirectLocation {
+pub(super) enum RedirectLocation {
     /// This BMC: strip the authority so a follow-up re-enters this proxy.
     Relative(http::HeaderValue, RedirectTarget),
     /// The target is malformed, ambiguous, unsupported, or external.
@@ -250,7 +250,7 @@ enum RedirectLocation {
 
 /// The bounded reason an upstream `Location` cannot be relayed safely.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum RedirectSuppressionReason {
+pub(super) enum RedirectSuppressionReason {
     InvalidHeaderValue,
     InvalidUriReference,
     UnsupportedScheme,
@@ -284,7 +284,7 @@ impl RedirectSuppressionReason {
 /// through the proxy. Cross-origin, non-HTTP(S), credential-bearing, malformed, and ambiguous
 /// targets are withheld. An explicit fragment is preserved; an absent fragment
 /// remains absent so HTTP's fragment-inheritance rule still applies.
-fn redirect_location(
+pub(super) fn redirect_location(
     value: &http::HeaderValue,
     origins: &BmcOrigins,
     sensitive_values: &[String],

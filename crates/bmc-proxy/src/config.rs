@@ -410,6 +410,9 @@ pub(crate) enum RedirectMode {
     /// scheme, host, and effective port.
     #[default]
     FollowSameOrigin,
+    /// Follow same-origin redirects only after validating and authorizing
+    /// every hop's effective method and resolved path for the original caller.
+    FollowAuthorized,
     /// Return safe same-BMC redirects to the caller for a separately
     /// authorized follow-up request.
     ReturnToClient,

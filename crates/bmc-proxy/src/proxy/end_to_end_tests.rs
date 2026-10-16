@@ -19,6 +19,7 @@
 //! to the answer, as the caller and the BMC observe it. Ingress and the
 //! allow-list middleware run before the handler and have their own tests.
 
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
@@ -50,8 +51,8 @@ use tracing_subscriber::layer::SubscriberExt;
 
 use crate::proxy::credentials::BmcCredentials;
 use crate::proxy::test_support::*;
-use crate::proxy::upstream::MAX_BUFFERED_BODY_SIZE;
-use crate::proxy::{BmcProxyState, proxy_request};
+use crate::proxy::upstream::{AttemptFailed, BmcFailure, MAX_BUFFERED_BODY_SIZE};
+use crate::proxy::{BmcProxyState, answer_failed_attempt, proxy_request};
 
 /// The fake BMC listens here, so the proxy reaches it at the IP it resolves,
 /// with only the port overridden, as it reaches a real BMC.
@@ -69,6 +70,10 @@ const LEAKY_PATH: &str = "/redfish/v1/Leaky";
 const UPLOAD_PATH: &str = "/redfish/v1/UpdateService/upload";
 /// Accepts only [`FRESH_PASSWORD`].
 const ROTATED_PATH: &str = "/redfish/v1/Rotated";
+/// Accepts only the fresh credential, then redirects to the rejecting endpoint.
+const ROTATED_MOVED_PATH: &str = "/redfish/v1/RotatedMoved";
+/// Echoes both credentials after the chain has used the cached and fresh values.
+const CHAIN_REJECTING_PATH: &str = "/redfish/v1/ChainRejecting";
 /// Rejects every credential, echoing the password it was sent.
 const REJECTING_PATH: &str = "/redfish/v1/UpdateService/rejecting";
 /// Answers after [`SLOW_ANSWER_DELAY`].
@@ -105,20 +110,43 @@ struct Received {
     path_and_query: String,
     headers: HeaderMap,
     body_len: usize,
+    body: Bytes,
+}
+
+/// A configurable response for a hop, including a controlled header delay.
+#[derive(Clone)]
+struct BmcReply {
+    status: StatusCode,
+    location: Option<String>,
+    delay: Duration,
 }
 
 /// A TLS listener standing in for one BMC, recording what it received.
 #[derive(Clone, Default)]
 struct FakeBmc {
     received: Arc<Mutex<Vec<Received>>>,
+    replies: Arc<Mutex<HashMap<String, BmcReply>>>,
 }
 
 impl FakeBmc {
     fn received(&self) -> Vec<Received> {
         self.received.lock().unwrap().clone()
     }
+
+    /// Configures the response and header delay for an observed request path.
+    fn reply(&self, path: &str, status: StatusCode, location: Option<&str>, delay: Duration) {
+        self.replies.lock().unwrap().insert(
+            path.to_string(),
+            BmcReply {
+                status,
+                location: location.map(str::to_string),
+                delay,
+            },
+        );
+    }
 }
 
+/// Records each request and serves controlled replies and credential challenges.
 async fn fake_bmc_handler(
     axum::extract::State(bmc): axum::extract::State<FakeBmc>,
     request: Request<Body>,
@@ -136,7 +164,17 @@ async fn fake_bmc_handler(
             .unwrap_or_default(),
         headers: parts.headers.clone(),
         body_len: body.len(),
+        body: body.clone(),
     });
+    let reply = bmc.replies.lock().unwrap().get(parts.uri.path()).cloned();
+    if let Some(reply) = reply {
+        tokio::time::sleep(reply.delay).await;
+        let mut response = http::Response::builder().status(reply.status);
+        if let Some(location) = reply.location {
+            response = response.header(header::LOCATION, location);
+        }
+        return response.body(Body::empty()).expect("fake reply builds");
+    }
     let authorization = parts
         .headers
         .get(header::AUTHORIZATION)
@@ -167,6 +205,21 @@ async fn fake_bmc_handler(
             SYSTEM_BODY.into_response()
         }
         (Method::GET, ROTATED_PATH) => StatusCode::UNAUTHORIZED.into_response(),
+        (Method::GET, ROTATED_MOVED_PATH)
+            if authorization == Some(basic(FRESH_PASSWORD).as_str()) =>
+        {
+            (
+                StatusCode::TEMPORARY_REDIRECT,
+                [(header::LOCATION, CHAIN_REJECTING_PATH)],
+            )
+                .into_response()
+        }
+        (Method::GET, ROTATED_MOVED_PATH) => StatusCode::UNAUTHORIZED.into_response(),
+        (Method::GET, CHAIN_REJECTING_PATH) => (
+            StatusCode::UNAUTHORIZED,
+            format!(r#"{{"error":"credentials {BMC_PASSWORD} and {FRESH_PASSWORD} rejected"}}"#),
+        )
+            .into_response(),
         (Method::GET, BRIEFLY_SLOW_PATH) => {
             tokio::time::sleep(Duration::from_millis(2500)).await;
             SYSTEM_BODY.into_response()
@@ -859,6 +912,515 @@ async fn return_to_client_mode_does_not_follow_the_redirect() {
     assert_eq!(paths, [MOVED_PATH]);
 }
 
+/// Only authorized intermediate hops reach the BMC; safe escaped targets keep
+/// their original query while fragments never become part of the request.
+#[tokio::test]
+async fn authorized_redirects_check_every_resolved_path() {
+    const INTERMEDIATE: &str = "/redfish/v1/Intermediate";
+    let metrics = MetricsCapture::start();
+    let window = &metrics;
+    check_cases_async(
+        [
+            Case {
+                scenario: "every hop is allowed",
+                input: (r#"["GET /**"]"#, SYSTEM_PATH),
+                expect: Yields((
+                    200,
+                    [MOVED_PATH, INTERMEDIATE, SYSTEM_PATH]
+                        .map(str::to_string)
+                        .to_vec(),
+                )),
+            },
+            Case {
+                scenario: "a denied intermediate hop cannot reach an allowed final target",
+                input: (
+                    r#"["GET /redfish/v1/Moved", "GET /redfish/v1/Systems/**"]"#,
+                    SYSTEM_PATH,
+                ),
+                expect: Yields((403, [MOVED_PATH].map(str::to_string).to_vec())),
+            },
+            Case {
+                scenario: "a broad allow does not cover an escaped redirect target",
+                input: (r#"["GET /**"]"#, "Registries/%23Resource"),
+                expect: Yields((403, [MOVED_PATH, INTERMEDIATE].map(str::to_string).to_vec())),
+            },
+            Case {
+                scenario: "a literal escape rule allows the resolved path and preserves the query",
+                input: (
+                    r#"["GET /**", "GET /redfish/v1/Registries/%23*"]"#,
+                    "Registries/%23Resource?%24select=Name#fragment",
+                ),
+                expect: Yields((
+                    404,
+                    [
+                        MOVED_PATH,
+                        INTERMEDIATE,
+                        "/redfish/v1/Registries/%23Resource?%24select=Name",
+                    ]
+                    .map(str::to_string)
+                    .to_vec(),
+                )),
+            },
+            Case {
+                scenario: "an explicit ACL cannot authorize an encoded separator",
+                input: (
+                    r#"["GET /**", "GET /redfish/v1/Registries/%2FName"]"#,
+                    "Registries/%2FName",
+                ),
+                expect: Yields((502, [MOVED_PATH, INTERMEDIATE].map(str::to_string).to_vec())),
+            },
+        ],
+        |(acl, target)| async move {
+            let (addr, bmc) = spawn_fake_bmc();
+            bmc.reply(
+                MOVED_PATH,
+                StatusCode::TEMPORARY_REDIRECT,
+                Some(INTERMEDIATE),
+                Duration::ZERO,
+            );
+            bmc.reply(
+                INTERMEDIATE,
+                StatusCode::TEMPORARY_REDIRECT,
+                Some(target),
+                Duration::ZERO,
+            );
+            let state = proxy_configured(
+                &format!(":{}", addr.port()),
+                acl,
+                "",
+                root_password(),
+                "follow_authorized",
+            )
+            .await;
+            let response = exchange(window, &state, get(MOVED_PATH)).await;
+            let paths = bmc
+                .received()
+                .into_iter()
+                .map(|request| request.path_and_query)
+                .collect::<Vec<_>>();
+            Ok::<_, Infallible>((response.status, paths))
+        },
+    )
+    .await;
+}
+
+/// ACL matching uses the redirected method, and body-preserving redirects
+/// replay only buffered bytes. A streamed body may be dropped for a 303 GET.
+#[tokio::test]
+async fn authorized_redirects_send_the_authorized_method_and_body() {
+    let metrics = MetricsCapture::start();
+    let window = &metrics;
+    check_cases_async(
+        [
+            Case {
+                scenario: "303 authorizes a bodyless GET and removes payload headers",
+                input: (StatusCode::SEE_OTHER, 7, SYSTEM_PATH),
+                expect: Yields((200, Some((Method::GET, 0, false)), true)),
+            },
+            Case {
+                scenario: "307 preserves the POST and its buffered payload",
+                input: (StatusCode::TEMPORARY_REDIRECT, 7, UPLOAD_PATH),
+                expect: Yields((202, Some((Method::POST, 7, true)), true)),
+            },
+            Case {
+                scenario: "307 returns a streamed-body redirect without replay",
+                input: (StatusCode::TEMPORARY_REDIRECT, MAX_BUFFERED_BODY_SIZE + 1, UPLOAD_PATH),
+                expect: Yields((307, None, true)),
+            },
+            Case {
+                scenario: "303 can discard a streamed body before following GET",
+                input: (StatusCode::SEE_OTHER, MAX_BUFFERED_BODY_SIZE + 1, SYSTEM_PATH),
+                expect: Yields((200, Some((Method::GET, 0, false)), true)),
+            },
+            Case {
+                scenario: "discarding a streamed body does not enable credential refresh",
+                input: (StatusCode::SEE_OTHER, MAX_BUFFERED_BODY_SIZE + 1, ROTATED_PATH),
+                expect: Yields((401, Some((Method::GET, 0, false)), true)),
+            },
+        ],
+        |(status, length, target)| async move {
+            let (addr, bmc) = spawn_fake_bmc();
+            bmc.reply(MOVED_PATH, status, Some(target), Duration::ZERO);
+            let mut state = proxy_configured(
+                &format!(":{}", addr.port()),
+                r#"["POST /redfish/v1/Moved", "GET /redfish/v1/Systems/**", "GET /redfish/v1/Rotated", "POST /redfish/v1/UpdateService/upload"]"#,
+                "", root_password(), "follow_authorized",
+            ).await;
+            state.api_client = fake_nico_api().await;
+            let payload = Bytes::from(vec![b'x'; length]);
+            let length_header = length.to_string();
+            let metadata = [
+                (header::CONTENT_TYPE, "application/octet-stream"),
+                (header::CONTENT_ENCODING, "identity"),
+                (header::CONTENT_LANGUAGE, "en"),
+                (header::CONTENT_LOCATION, "/original-representation"),
+                (header::CONTENT_RANGE, "bytes 0-6/7"),
+                (header::LAST_MODIFIED, "Mon, 12 Oct 2026 00:00:00 GMT"),
+                (header::EXPECT, "100-continue"),
+                (HeaderName::from_static("digest"), "SHA-256=original"),
+                (HeaderName::from_static("content-digest"), "sha-256=:b3JpZ2luYWw=:"),
+                (HeaderName::from_static("repr-digest"), "sha-256=:b3JpZ2luYWw=:"),
+                (HeaderName::from_static("content-md5"), "b3JpZ2luYWw="),
+            ];
+            let mut headers = metadata.to_vec();
+            headers.push((header::CONTENT_LENGTH, length_header.as_str()));
+            let response = exchange(
+                window,
+                &state,
+                proxied(
+                    Method::POST, MOVED_PATH, to_the_bmc(),
+                    &headers,
+                    Body::from(payload.clone()),
+                ),
+            ).await;
+            let received = bmc.received();
+            assert_eq!(received.len(), if response.status == 307 { 1 } else { 2 });
+            let next = received.get(1).map(|request| {
+                let has_metadata = metadata.iter().any(|(name, _)| request.headers.contains_key(name));
+                if request.method == Method::POST {
+                    assert!(metadata.iter().all(|(name, value)| request.headers.get(name)
+                        .and_then(|header| header.to_str().ok()) == Some(*value)));
+                }
+                (request.method.clone(), request.body_len, has_metadata)
+            });
+            let correct_bytes = received[0].body == payload
+                && received.get(1).is_none_or(|request| request.body.is_empty() || request.body == payload);
+            Ok::<_, Infallible>((response.status, next, correct_bytes))
+        },
+    ).await;
+}
+
+/// Refreshing a credential never replays an earlier POST. The single refresh
+/// allowance covers the whole chain, including a later authentication rejection.
+#[tokio::test]
+async fn authorized_redirects_refresh_only_the_rejected_hop_once() {
+    let metrics = MetricsCapture::start();
+    let window = &metrics;
+    check_cases_async(
+        [
+            Case {
+                scenario: "the rejected GET is retried with a fresh credential",
+                input: ROTATED_PATH,
+                expect: Yields((
+                    200,
+                    [MOVED_PATH, ROTATED_PATH, ROTATED_PATH]
+                        .map(str::to_string)
+                        .to_vec(),
+                    vec!["cached", "cached", "fresh"],
+                    false,
+                )),
+            },
+            Case {
+                scenario: "a later rejection does not get a second refresh",
+                input: ROTATED_MOVED_PATH,
+                expect: Yields((
+                    401,
+                    [
+                        MOVED_PATH,
+                        ROTATED_MOVED_PATH,
+                        ROTATED_MOVED_PATH,
+                        CHAIN_REJECTING_PATH,
+                    ]
+                    .map(str::to_string)
+                    .to_vec(),
+                    vec!["cached", "cached", "fresh", "fresh"],
+                    false,
+                )),
+            },
+        ],
+        |target| async move {
+            let (addr, bmc) = spawn_fake_bmc();
+            bmc.reply(
+                MOVED_PATH,
+                StatusCode::SEE_OTHER,
+                Some(target),
+                Duration::ZERO,
+            );
+            let mut state = proxy_configured(
+                &format!(":{}", addr.port()),
+                r#"["POST /redfish/v1/Moved", "GET /**"]"#,
+                "",
+                root_password(),
+                "follow_authorized",
+            )
+            .await;
+            state.api_client = fake_nico_api().await;
+            let response = exchange(
+                window,
+                &state,
+                proxied(
+                    Method::POST,
+                    MOVED_PATH,
+                    to_the_bmc(),
+                    &[],
+                    Body::from("mutating operation"),
+                ),
+            )
+            .await;
+            let received = bmc.received();
+            assert_eq!(received[0].method, Method::POST);
+            assert!(
+                received[1..]
+                    .iter()
+                    .all(|request| request.method == Method::GET)
+            );
+            let credentials = received.iter().map(credential_sent).collect::<Vec<_>>();
+            let paths = received
+                .into_iter()
+                .map(|request| request.path_and_query)
+                .collect::<Vec<_>>();
+            let body = String::from_utf8_lossy(&response.body);
+            let leaked = body.contains(BMC_PASSWORD) || body.contains(FRESH_PASSWORD);
+            Ok::<_, Infallible>((response.status, paths, credentials, leaked))
+        },
+    )
+    .await;
+}
+
+/// The sixth redirect is rejected before contacting a seventh destination.
+#[tokio::test]
+async fn authorized_redirects_keep_the_five_hop_limit() {
+    let metrics = MetricsCapture::start();
+    let (addr, bmc) = spawn_fake_bmc();
+    bmc.reply(
+        MOVED_PATH,
+        StatusCode::TEMPORARY_REDIRECT,
+        Some(MOVED_PATH),
+        Duration::ZERO,
+    );
+    let state = proxy_configured(
+        &format!(":{}", addr.port()),
+        r#"["GET /**"]"#,
+        "",
+        root_password(),
+        "follow_authorized",
+    )
+    .await;
+    let response = exchange(&metrics, &state, get(MOVED_PATH)).await;
+    assert_eq!(response.status, 502);
+    assert_eq!(bmc.received().len(), 6);
+    assert_eq!(
+        metrics.counter_delta(
+            "carbide_bmc_proxy_redirects_total",
+            &[
+                ("mode", "follow_authorized"),
+                ("status", "307"),
+                ("target", "same_origin"),
+                ("disposition", "limit_exceeded")
+            ],
+        ),
+        1.0
+    );
+}
+
+/// Authorized redirects add half the original budget to the existing deadline,
+/// retaining unused time without compounding the extensions.
+#[tokio::test]
+async fn authorized_redirects_extend_the_deadline_linearly() {
+    let metrics = MetricsCapture::start();
+    let metrics_window = &metrics;
+    check_cases_async(
+        [
+            Case {
+                scenario: "one redirect retains unused time and adds half the class budget",
+                input: (1200, None, 1200),
+                expect: Yields((200, 2, None, 2)),
+            },
+            Case {
+                scenario: "two redirects exhaust the linear budget and open the breaker",
+                input: (600, Some(600), 3000),
+                expect: Yields((502, 3, Some(503), 3)),
+            },
+        ],
+        |(initial_ms, intermediate_ms, final_ms)| async move {
+            let (addr, bmc) = spawn_fake_bmc();
+            let intermediate = "/redfish/v1/Intermediate";
+            bmc.reply(
+                MOVED_PATH,
+                StatusCode::TEMPORARY_REDIRECT,
+                Some(if intermediate_ms.is_some() {
+                    intermediate
+                } else {
+                    SYSTEM_PATH
+                }),
+                Duration::from_millis(initial_ms),
+            );
+            if let Some(delay) = intermediate_ms {
+                bmc.reply(
+                    intermediate,
+                    StatusCode::TEMPORARY_REDIRECT,
+                    Some(SYSTEM_PATH),
+                    Duration::from_millis(delay),
+                );
+            }
+            bmc.reply(
+                SYSTEM_PATH,
+                StatusCode::OK,
+                None,
+                Duration::from_millis(final_ms),
+            );
+            let state = proxy_configured(
+                &format!(":{}", addr.port()),
+                r#"["GET /**"]"#,
+                r#"
+        [[class]]
+        name = "chain"
+        match = ["GET /redfish/v1/Moved"]
+        upstream_timeout = "2s"
+        breaker = { window = 1, min_samples = 1, cool_down = "10m", trip_on = ["timeout"] }
+        "#,
+                root_password(),
+                "follow_authorized",
+            )
+            .await;
+            let response = exchange(metrics_window, &state, get(MOVED_PATH)).await;
+            let received = bmc.received().len();
+            let next_status = if response.status == 502 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                Some(
+                    exchange(metrics_window, &state, get(MOVED_PATH))
+                        .await
+                        .status,
+                )
+            } else {
+                None
+            };
+            Ok::<_, Infallible>((response.status, received, next_status, bmc.received().len()))
+        },
+    )
+    .await;
+}
+
+/// One global slot permits the entire chain and remains held by its original
+/// class beyond the legacy two-budget bound until the final body is sent.
+#[tokio::test]
+async fn authorized_redirects_keep_one_original_admission_slot() {
+    let _metrics = MetricsCapture::start();
+    let (addr, bmc) = spawn_fake_bmc();
+    for (path, target) in [
+        (MOVED_PATH, "/redfish/v1/Step1"),
+        ("/redfish/v1/Step1", "/redfish/v1/Step2"),
+        ("/redfish/v1/Step2", SYSTEM_PATH),
+    ] {
+        bmc.reply(
+            path,
+            StatusCode::TEMPORARY_REDIRECT,
+            Some(target),
+            Duration::from_millis(600),
+        );
+    }
+    bmc.reply(
+        SYSTEM_PATH,
+        StatusCode::OK,
+        None,
+        Duration::from_millis(300),
+    );
+    let state = proxy_configured(
+        &format!(":{}", addr.port()),
+        r#"["GET /**"]"#,
+        r#"
+        [admission]
+        max_in_flight_per_bmc = 1
+        [[class]]
+        name = "original"
+        match = ["GET /redfish/v1/Moved"]
+        max_in_flight = 1
+        upstream_timeout = "1s"
+        "#,
+        root_password(),
+        "follow_authorized",
+    )
+    .await;
+    let unread = answer(&state, get(MOVED_PATH)).await;
+    assert_eq!(unread.status(), StatusCode::OK);
+    let waiting = answer(&state, get(MOVED_PATH)).await;
+    assert_eq!(waiting.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(bmc.received().len(), 4);
+    drop(unread);
+    assert_eq!(
+        answer(&state, get(MOVED_PATH)).await.status(),
+        StatusCode::OK
+    );
+    assert_eq!(bmc.received().len(), 8);
+}
+
+/// The breaker consumes timeout metadata for the complete BMC attempt, keeping
+/// local-wait and streamed-send timeouts out of its failure count.
+#[tokio::test]
+async fn authorized_redirects_account_for_prior_bmc_replies() {
+    let metrics = MetricsCapture::start();
+    let metrics_window = &metrics;
+    check_cases_async(
+        [
+            Case {
+                scenario: "a short first attempt does not blame the BMC for local waiting",
+                input: (Duration::ZERO, false),
+                expect: Yields((200, 1)),
+            },
+            Case {
+                scenario: "preceding BMC replies count despite a short final-hop remainder",
+                input: (Duration::from_millis(1200), false),
+                expect: Yields((503, 0)),
+            },
+            Case {
+                scenario: "a timed-out streamed send remains excluded",
+                input: (Duration::from_millis(1200), true),
+                expect: Yields((200, 1)),
+            },
+        ],
+        |(prior_bmc_time, streamed)| async move {
+            let (addr, bmc) = spawn_fake_bmc();
+            let state = proxy_configured(
+                &format!(":{}", addr.port()),
+                r#"["GET /**"]"#,
+                r#"
+        [[class]]
+        name = "chain"
+        match = ["GET /**"]
+        upstream_timeout = "2s"
+        breaker = { window = 1, min_samples = 1, cool_down = "10m", trip_on = ["timeout"] }
+        "#,
+                root_password(),
+                "follow_authorized",
+            )
+            .await;
+            let class = state
+                .config
+                .classes
+                .classify(&Method::GET, SYSTEM_PATH, &[]);
+            let now = tokio::time::Instant::now();
+            let mut slot = state
+                .admission
+                .acquire(
+                    FAKE_BMC_IP.parse().unwrap(),
+                    class,
+                    now,
+                    now + class.upstream_timeout,
+                    class.upstream_timeout,
+                )
+                .await
+                .expect("admitted before the failure");
+            let failed = AttemptFailed {
+                response: StatusCode::BAD_GATEWAY.into_response(),
+                by_bmc: Some(BmcFailure::TimedOut {
+                    budget: Duration::from_millis(400),
+                    streamed,
+                }),
+            }
+            .with_prior_bmc_time(prior_bmc_time);
+            assert_eq!(
+                answer_failed_attempt(&mut slot, failed, class).status(),
+                StatusCode::BAD_GATEWAY
+            );
+            drop(slot);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let next = exchange(metrics_window, &state, get(SYSTEM_PATH)).await;
+            Ok::<_, Infallible>((next.status, bmc.received().len()))
+        },
+    )
+    .await;
+}
+
 /// A caller naming its BMC by MAC address reaches the BMC at the IP that
 /// address resolves to.
 #[tokio::test]
@@ -1397,6 +1959,8 @@ enum BreakerScenario {
     /// The BMC's cached credential is a session token no header can carry,
     /// so the proxy fails every attempt before sending it.
     ProxyCannotUseTheCredential,
+    /// The initial request is allowed, but a redirect target is denied locally.
+    RedirectAclDenied,
 }
 
 /// The statuses three requests get from a proxy with a [`breaker`] failing on
@@ -1413,6 +1977,7 @@ async fn three_requests(
         BreakerScenario::BmcAnswersTheReplayAfterTheBudget => (addr.port(), SLOW_ROTATED_PATH),
         BreakerScenario::BmcAnswersWithAnError => (addr.port(), LEAKY_PATH),
         BreakerScenario::ProxyCannotUseTheCredential => (addr.port(), SYSTEM_PATH),
+        BreakerScenario::RedirectAclDenied => (addr.port(), MOVED_PATH),
     };
     let credentials = match scenario {
         BreakerScenario::ProxyCannotUseTheCredential => BmcCredentials::SessionToken {
@@ -1420,12 +1985,17 @@ async fn three_requests(
         },
         _ => root_password(),
     };
+    let (acl, mode) = if matches!(scenario, BreakerScenario::RedirectAclDenied) {
+        (r#"["GET /redfish/v1/Moved"]"#, "follow_authorized")
+    } else {
+        (r#"["/**"]"#, "follow_same_origin")
+    };
     let mut state = proxy_configured(
         &format!(":{port}"),
-        r#"["/**"]"#,
+        acl,
         &format!("{QUICK_CLASS}{}", breaker(trip_on)),
         credentials,
-        "follow_same_origin",
+        mode,
     )
     .await;
     state.api_client = fake_nico_api().await;
@@ -1496,6 +2066,11 @@ async fn what_trips_a_bmcs_breaker() {
                 input: (BreakerScenario::ProxyCannotUseTheCredential, WITH_5XX),
                 expect: Yields(vec![502, 502, 502]),
             },
+            Case {
+                scenario: "a local redirect denial never trips the BMC's 403 breaker",
+                input: (BreakerScenario::RedirectAclDenied, Some(r#"["403"]"#)),
+                expect: Yields(vec![403, 403, 403]),
+            },
         ],
         |input| async move { Ok::<_, Infallible>(three_requests(metrics_window, input).await) },
     )
@@ -1509,12 +2084,27 @@ async fn what_trips_a_bmcs_breaker() {
 #[tokio::test]
 async fn a_timeout_from_waiting_is_not_the_bmcs() {
     let metrics = MetricsCapture::start();
-    let (addr, _bmc) = spawn_fake_bmc();
-    let state = proxy_configured(
-        &format!(":{}", addr.port()),
-        r#"["/**"]"#,
-        &format!(
-            r#"
+    let metrics_window = &metrics;
+    check_cases_async(
+        [
+            Case {
+                scenario: "legacy following excludes time lost to queueing",
+                input: "follow_same_origin",
+                expect: Yields((200, 502, 200)),
+            },
+            Case {
+                scenario: "authorized following excludes time lost to queueing",
+                input: "follow_authorized",
+                expect: Yields((200, 502, 200)),
+            },
+        ],
+        |mode| async move {
+            let (addr, _bmc) = spawn_fake_bmc();
+            let state = proxy_configured(
+                &format!(":{}", addr.port()),
+                r#"["/**"]"#,
+                &format!(
+                    r#"
             [[class]]
             name = "one_at_a_time"
             match = ["GET {BRIEFLY_SLOW_PATH}"]
@@ -1526,20 +2116,23 @@ async fn a_timeout_from_waiting_is_not_the_bmcs() {
             min_samples = 1
             cool_down = "10m"
             "#
-        ),
-        root_password(),
-        "follow_same_origin",
+                ),
+                root_password(),
+                mode,
+            )
+            .await;
+            let first = exchange(metrics_window, &state, get(BRIEFLY_SLOW_PATH));
+            let waiting = async {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                exchange(metrics_window, &state, get(BRIEFLY_SLOW_PATH)).await
+            };
+            let (first, waiting) = tokio::join!(first, waiting);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let next = exchange(metrics_window, &state, get(BRIEFLY_SLOW_PATH)).await;
+            Ok::<_, Infallible>((first.status, waiting.status, next.status))
+        },
     )
     .await;
-    let first = exchange(&metrics, &state, get(BRIEFLY_SLOW_PATH));
-    let waiting = async {
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        exchange(&metrics, &state, get(BRIEFLY_SLOW_PATH)).await
-    };
-    let (first, waiting) = tokio::join!(first, waiting);
-    tokio::time::sleep(Duration::from_millis(20)).await;
-    let next = exchange(&metrics, &state, get(BRIEFLY_SLOW_PATH)).await;
-    assert_eq!((first.status, waiting.status, next.status), (200, 502, 200));
 }
 
 /// Only the BMC's answer to a request's last attempt counts: the 401 that

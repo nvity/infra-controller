@@ -58,7 +58,7 @@ const PATH_PROBE_BASE: &str = "https://bmc-proxy.invalid";
 
 /// Reject URL-parser rewrites and escapes that change path structure. Other
 /// escapes remain literal: an ACL allow must explicitly spell each one.
-fn path_rejection_reason(path: &str) -> Option<&'static str> {
+pub(super) fn path_rejection_reason(path: &str) -> Option<&'static str> {
     let Ok(parsed) = Url::parse(&format!("{PATH_PROBE_BASE}{path}")) else {
         return Some("invalid_path");
     };
@@ -95,23 +95,30 @@ impl BmcProxyState {
         };
 
         let principal_ids = request_principal_ids(auth_context);
-        let allowed = principal_ids.iter().any(|principal| {
-            self.config
-                .auth
-                .acls
-                .allows(principal, request.method(), request.uri().path())
-        });
+        self.authorize_method_path(&principal_ids, request.method(), request.uri().path())
+            .then_some(principal_ids)
+    }
+
+    /// Checks the ACL for the original caller's identifiers and the method and
+    /// path actually being sent. Records policy denials separately from BMC errors.
+    pub(super) fn authorize_method_path(
+        &self,
+        principal_ids: &[String],
+        method: &http::Method,
+        path: &str,
+    ) -> bool {
+        let allowed = principal_ids
+            .iter()
+            .any(|principal| self.config.auth.acls.allows(principal, method, path));
 
         if !allowed {
             emit(RequestAclDenied::new(
-                request.method(),
+                method,
                 format!("{principal_ids:?}"),
-                request.uri().path().to_string(),
+                path.to_string(),
             ));
-            return None;
         }
-
-        Some(principal_ids)
+        allowed
     }
 }
 

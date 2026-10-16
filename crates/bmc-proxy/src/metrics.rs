@@ -402,7 +402,8 @@ pub(crate) struct RedirectObserved {
 /// The duration covers the upstream leg through the response headers;
 /// response bodies stream back separately. In `follow_same_origin` mode one
 /// send may follow up to five redirects, so the status is the final hop's; in
-/// `return_to_client` mode it is the first response. Metric-only: the forward
+/// `return_to_client` mode it is the first response. In `follow_authorized`,
+/// each HTTP hop and credential retry is measured separately. Metric-only: the forward
 /// has never logged per request in either direction, and a failure's detail
 /// already reaches the caller in the 502 response body.
 #[derive(Event)]
